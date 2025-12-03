@@ -31,31 +31,42 @@ class PDFProcessor {
       console.log(`  ✓ File read (${dataBuffer.length} bytes)`);
       
       const pdfData = await pdfParse(dataBuffer, {
-        max: 0, // Parse all pages
+        max: 0,
         version: 'default'
       });
       
       console.log(`  ✓ PDF parsed (${pdfData.numpages} pages, ${pdfData.text.length} chars)`);
       
       const fullText = pdfData.text;
-      const fileName = path.basename(filePath, '.pdf');
+      const originalFileName = path.basename(filePath);
+      const fileNameWithoutExt = path.basename(filePath, '.pdf');
       
-      // Extract everything
-      const patentInfo = this.extractPatentInfo(fullText, fileName, pdfData.numpages);
+      const patentInfo = this.extractPatentInfo(fullText, fileNameWithoutExt, pdfData.numpages);
+      
       console.log(`  ✓ Patent Number: ${patentInfo.patentNumber}`);
       console.log(`  ✓ Title: ${patentInfo.title.substring(0, 50)}...`);
       console.log(`  ✓ Abstract length: ${patentInfo.abstract.length} chars`);
-      console.log(`  ✓ Sections found: ${patentInfo.sections.length}`);
-      console.log(`  ✓ Tables found: ${patentInfo.tables.length}`);
-      console.log(`  ✓ Compositions found: ${patentInfo.compositions.length}`);
-      console.log(`  ✓ Keywords: ${patentInfo.keywords.join(', ')}`);
+      console.log(`  ✓ Header info: ${Object.keys(patentInfo.headerInfo).length} fields`);
+      console.log(`  ✓ Numbered paragraphs: ${patentInfo.numberedParagraphs.length}`);
+      
+      if (patentInfo.numberedParagraphs.length > 0) {
+        const lastPara = patentInfo.numberedParagraphs[patentInfo.numberedParagraphs.length - 1];
+        console.log(`  ✓ Paragraph range: [${String(patentInfo.numberedParagraphs[0].number).padStart(4, '0')}] - [${String(lastPara.number).padStart(4, '0')}]`);
+      }
+      
+      console.log(`  ✓ Sections: ${patentInfo.sections.length}`);
+      console.log(`  ✓ Tables: ${patentInfo.tables.length}`);
+      console.log(`  ✓ Compositions: ${patentInfo.compositions.length}`);
+      console.log(`  ✓ Claims: ${patentInfo.claims.length}`);
       
       return { 
         ...patentInfo, 
-        fullText, 
-        fileName: path.basename(filePath),
+        fullText,
+        originalFileName: originalFileName,
         numPages: pdfData.numpages,
-        textLength: fullText.length
+        textLength: fullText.length,
+        fileSize: dataBuffer.length,
+        pdfAvailable: true
       };
     } catch (error) {
       console.error(`❌ Error processing ${path.basename(filePath)}:`, error.message);
@@ -67,247 +78,308 @@ class PDFProcessor {
     console.log('  → Extracting patent info...');
     
     const patentNumberMatch = text.match(/EP\s*[\d\s]+A\d/i) || 
-                              text.match(/EP[\d]+A\d/i) ||
-                              text.match(/EP\d{7}A\d/i);
+                              text.match(/\(11\)\s*EP\s*[\d\s]+A\d/i) ||
+                              text.match(/EP[\d]+A\d/i);
     
     const patentNumber = patentNumberMatch 
-      ? patentNumberMatch[0].replace(/\s/g, '').toUpperCase() 
+      ? patentNumberMatch[0].replace(/\(11\)\s*/i, '').replace(/\s/g, '').toUpperCase() 
       : fileName.toUpperCase().replace(/_/g, '');
     
+    const headerInfo = this.extractHeaderInfo(text);
     const title = this.extractTitle(text);
     const abstract = this.extractAbstract(text);
+    const numberedParagraphs = this.extractNumberedParagraphs(text);
     const sections = this.extractSections(text, numPages);
     const tables = this.extractTables(text);
     const compositions = this.extractCompositions(text);
     const technicalDetails = this.extractTechnicalDetails(text);
     const keywords = this.extractKeywords(text);
+    const claims = this.extractClaims(text);
+    
+    // Create searchable content combining everything
+    const searchableContent = this.createSearchableContent({
+      title,
+      abstract,
+      numberedParagraphs,
+      sections,
+      tables,
+      compositions,
+      claims
+    });
 
     return {
       patentNumber,
       title,
       abstract,
+      headerInfo,
+      numberedParagraphs,
       sections,
       tables,
       compositions,
       technicalDetails,
       keywords,
+      claims,
+      searchableContent, // For better LLM context
       processedAt: new Date().toISOString()
     };
   }
 
+  extractNumberedParagraphs(text) {
+    const paragraphs = [];
+    
+    // Multiple patterns to catch different formatting styles
+    const patterns = [
+      /\[(\d{4})\]\s*([^\[]+?)(?=\s*\[\d{4}\]|\s*$)/gs,  // [0001] with content
+      /\[0*(\d+)\]\s*([^\[]+?)(?=\s*\[0*\d+\]|\s*$)/gs,  // [01] or [001] formats
+      /【(\d{4})】\s*([^【]+?)(?=\s*【\d{4}】|\s*$)/gs      // Japanese brackets
+    ];
+    
+    let allMatches = [];
+    
+    for (let pattern of patterns) {
+      let match;
+      const regex = new RegExp(pattern);
+      
+      while ((match = regex.exec(text)) !== null) {
+        const number = parseInt(match[1]);
+        let content = match[2].trim();
+        
+        // Clean up content
+        content = content
+          .replace(/\s+/g, ' ')           // Normalize whitespace
+          .replace(/\n\s*\n/g, '\n')      // Remove empty lines
+          .trim();
+        
+        // Only include if substantial content
+        if (content.length > 15 && number > 0 && number < 10000) {
+          allMatches.push({
+            number: number,
+            content: content,
+            marker: `[${String(number).padStart(4, '0')}]`,
+            length: content.length
+          });
+        }
+      }
+    }
+    
+    // Remove duplicates based on number
+    const uniqueParagraphs = [];
+    const seenNumbers = new Set();
+    
+    // Sort by number
+    allMatches.sort((a, b) => a.number - b.number);
+    
+    for (let para of allMatches) {
+      if (!seenNumbers.has(para.number)) {
+        seenNumbers.add(para.number);
+        uniqueParagraphs.push(para);
+      } else {
+        // If duplicate, keep the longer one
+        const existingIndex = uniqueParagraphs.findIndex(p => p.number === para.number);
+        if (existingIndex >= 0 && para.content.length > uniqueParagraphs[existingIndex].content.length) {
+          uniqueParagraphs[existingIndex] = para;
+        }
+      }
+    }
+    
+    console.log(`    Found ${uniqueParagraphs.length} numbered paragraphs`);
+    
+    // Check continuity
+    if (uniqueParagraphs.length > 0) {
+      const gaps = [];
+      for (let i = 1; i < uniqueParagraphs.length; i++) {
+        const gap = uniqueParagraphs[i].number - uniqueParagraphs[i-1].number;
+        if (gap > 1) {
+          gaps.push(`${uniqueParagraphs[i-1].number}→${uniqueParagraphs[i].number}`);
+        }
+      }
+      if (gaps.length > 0 && gaps.length < 10) {
+        console.log(`    ⚠ Gaps detected: ${gaps.join(', ')}`);
+      }
+    }
+    
+    return uniqueParagraphs;
+  }
+
+  createSearchableContent(data) {
+    // Combine all content for better LLM searching
+    let content = '';
+    
+    // Add title and abstract
+    content += `TITLE: ${data.title}\n\n`;
+    content += `ABSTRACT: ${data.abstract}\n\n`;
+    
+    // Add all numbered paragraphs with markers
+    if (data.numberedParagraphs && data.numberedParagraphs.length > 0) {
+      content += `DETAILED DESCRIPTION:\n`;
+      data.numberedParagraphs.forEach(para => {
+        content += `${para.marker} ${para.content}\n`;
+      });
+      content += '\n';
+    }
+    
+    // Add sections
+    if (data.sections && data.sections.length > 0) {
+      data.sections.forEach(section => {
+        content += `${section.name.toUpperCase()}:\n${section.content}\n\n`;
+      });
+    }
+    
+    // Add tables
+    if (data.tables && data.tables.length > 0) {
+      data.tables.forEach(table => {
+        content += `TABLE ${table.tableNumber}: ${table.content}\n\n`;
+      });
+    }
+    
+    // Add claims
+    if (data.claims && data.claims.length > 0) {
+      content += `CLAIMS:\n`;
+      data.claims.forEach(claim => {
+        content += `Claim ${claim.number}: ${claim.text}\n`;
+      });
+    }
+    
+    return content;
+  }
+
+  extractHeaderInfo(text) {
+    const info = {};
+    
+    const appNumMatch = text.match(/\(21\)\s*Application number:\s*([\d.]+)/i);
+    if (appNumMatch) info.applicationNumber = appNumMatch[1];
+    
+    const filingDateMatch = text.match(/\(22\)\s*Date of filing:\s*([\d.]+)/i);
+    if (filingDateMatch) info.filingDate = filingDateMatch[1];
+    
+    const pubDateMatch = text.match(/\(43\)\s*Date of publication:\s*([\d.]+)/i);
+    if (pubDateMatch) info.publicationDate = pubDateMatch[1];
+    
+    const priorityMatch = text.match(/\(30\)\s*Priority:\s*([^\n]+)/i);
+    if (priorityMatch) info.priority = priorityMatch[1].trim();
+    
+    const applicantMatch = text.match(/\(71\)\s*Applicant[s]?:\s*([^\n]+)/i);
+    if (applicantMatch) info.applicant = applicantMatch[1].trim();
+    
+    const inventorMatches = [...text.matchAll(/\(72\)\s*Inventor[s]?:\s*([^\n]+)/gi)];
+    if (inventorMatches.length > 0) {
+      info.inventors = inventorMatches.map(m => m[1].trim());
+    }
+    
+    const classMatch = text.match(/\(51\)\s*Int\s*Cl[.\d]*:\s*([^\n]+)/i);
+    if (classMatch) info.classification = classMatch[1].trim();
+    
+    return info;
+  }
+
   extractTitle(text) {
     const patterns = [
-      /\(54\)\s*([A-Z][A-Z\s\-]+(?:STEEL|SHEET|METHOD|PROCESS|MAGNETIC|ALLOY|MATERIAL)[A-Z\s\-]*)/i,
-      /Title[:\s]+([A-Z][^\n]{20,200})/i,
-      /Invention[:\s]+([A-Z][^\n]{20,200})/i,
+      /\(54\)\s*([A-Z][A-Z\s\-\/]+(?:STEEL|SHEET|METHOD|PROCESS|MAGNETIC|ALLOY|MATERIAL|PRODUCTION|CONTAINING)[A-Z\s\-\/]*)/i,
+      /Title[:\s]+([A-Z][^\n]{20,300})/i,
     ];
     
     for (let pattern of patterns) {
       const match = text.match(pattern);
       if (match && match[1]) {
         const title = match[1].trim().replace(/\s+/g, ' ');
-        console.log(`    Found title: ${title.substring(0, 50)}...`);
-        return title.substring(0, 250);
+        return title.substring(0, 300);
       }
     }
     
-    console.log('    ⚠ Title not found, using default');
     return 'Patent Document';
   }
 
   extractAbstract(text) {
     const patterns = [
-      /\(57\)[\s\S]*?((?:An?|The)\s+[^.]+\.[\s\S]{100,2500}?)(?=\n\n\n|FIG\.|BRIEF|DESCRIPTION|CLAIMS|\[0001\])/i,
-      /Abstract[\s:]*\n([\s\S]{100,2500}?)(?=\n\n\n|DESCRIPTION|FIELD|BACKGROUND|TECHNICAL)/i,
-      /\(57\)([\s\S]{100,2500}?)(?=FIG\.|Figure|BRIEF|\[0001\])/i,
+      /\(57\)\s*([A-Z][^]*?)(?=\n\s*EP\s*\d|Europäisches|European Patent|DETAILED DESCRIPTION|DESCRIPTION OF|TECHNICAL FIELD|\[0*1\]|【0*1】|Claims|$)/i,
+      /Abstract[:\s]*\n([^]*?)(?=\n\s*\[0*1\]|【0*1】|TECHNICAL FIELD|Claims|$)/i,
     ];
     
     for (let pattern of patterns) {
       const match = text.match(pattern);
       if (match && match[1]) {
-        const abstract = match[1]
+        let abstract = match[1]
           .trim()
           .replace(/\s+/g, ' ')
-          .replace(/\[[0-9]+\]/g, '');
+          .replace(/\[0*\d+\]/g, '')
+          .replace(/【0*\d+】/g, '')
+          .replace(/^\s*Abstract[:\s]*/i, '');
         
         if (abstract.length > 100) {
-          console.log(`    Found abstract: ${abstract.substring(0, 80)}...`);
-          return abstract.substring(0, 2000);
+          return abstract.substring(0, 4000);
         }
       }
     }
     
-    const paragraphs = text.split(/\n\n+/);
-    for (let para of paragraphs) {
-      const cleaned = para.trim().replace(/\s+/g, ' ');
-      if (cleaned.length > 200 && cleaned.length < 3000 && /^[A-Z]/.test(cleaned)) {
-        console.log('    Using fallback abstract');
-        return cleaned.substring(0, 2000);
-      }
-    }
-    
-    console.log('    ⚠ Abstract not found');
     return 'Abstract not available for this patent document.';
   }
 
   extractSections(text, numPages) {
     const sections = [];
     
-    // Extract page markers [0001], [0002], etc.
-    const pageMarkers = [...text.matchAll(/\[(\d{4})\]/g)];
-    
     const sectionHeaders = [
       'TECHNICAL FIELD',
-      'FIELD OF THE INVENTION',
-      'FIELD OF INVENTION',
       'BACKGROUND ART',
-      'BACKGROUND OF THE INVENTION',
-      'BACKGROUND',
-      'PRIOR ART',
       'SUMMARY OF INVENTION',
-      'SUMMARY OF THE INVENTION',
-      'SUMMARY',
-      'DISCLOSURE OF INVENTION',
       'TECHNICAL PROBLEM',
-      'PROBLEM TO BE SOLVED',
       'SOLUTION TO PROBLEM',
-      'MEANS FOR SOLVING THE PROBLEM',
-      'SOLUTION',
       'ADVANTAGEOUS EFFECTS',
-      'ADVANTAGEOUS EFFECTS OF INVENTION',
-      'EFFECTS OF THE INVENTION',
       'DESCRIPTION OF EMBODIMENTS',
-      'DETAILED DESCRIPTION',
-      'DESCRIPTION OF THE EMBODIMENTS',
-      'EMBODIMENTS',
       'BEST MODE',
       'EXAMPLES',
-      'EXAMPLE',
-      'WORKING EXAMPLES',
-      'COMPARATIVE EXAMPLES',
-      'INDUSTRIAL APPLICABILITY',
-      'MODE FOR CARRYING OUT THE INVENTION',
-      'MODE FOR THE INVENTION'
+      'INDUSTRIAL APPLICABILITY'
     ];
 
     sectionHeaders.forEach(header => {
-      // More flexible regex to catch variations
       const regex = new RegExp(
-        `${header.replace(/\s/g, '\\s*')}[\\s\\S]{0,150}?([\\s\\S]{100,5000}?)(?=\\n\\s*[A-Z][A-Z\\s]{10,}|$)`, 
+        `${header.replace(/\s/g, '\\s+')}\\s*([\\s\\S]{100,10000}?)(?=\\n\\s*[A-Z][A-Z\\s]{10,}|$)`, 
         'i'
       );
       const match = text.match(regex);
       
       if (match && match[1]) {
-        const sectionStartIndex = text.indexOf(match[0]);
-        let pageNumber = 1;
-        
-        // Calculate page number
-        for (let marker of pageMarkers) {
-          if (marker.index < sectionStartIndex) {
-            const markerNum = parseInt(marker[1]);
-            pageNumber = Math.max(1, Math.floor(markerNum / 5) + 1);
-          }
-        }
-
-        // If no markers, estimate from position in text
-        if (pageMarkers.length === 0 && numPages > 1) {
-          const relativePosition = sectionStartIndex / text.length;
-          pageNumber = Math.max(1, Math.ceil(relativePosition * numPages));
-        }
-
         const content = match[1]
           .trim()
           .replace(/\s+/g, ' ')
-          .replace(/\[[0-9]+\]/g, '');
+          .substring(0, 10000);
+
+        const pageMatch = match[0].match(/\[0*(\d+)\]/);
+        const pageNumber = pageMatch ? Math.ceil(parseInt(pageMatch[1]) / 5) : 1;
 
         sections.push({
           name: this.formatSectionName(header),
-          content: content.substring(0, 5000),
-          page: pageNumber,
-          startIndex: sectionStartIndex
+          content: content,
+          page: pageNumber
         });
       }
     });
 
-    // Sort sections by appearance in document
-    sections.sort((a, b) => a.startIndex - b.startIndex);
-    sections.forEach(s => delete s.startIndex);
-
-    console.log(`    Found ${sections.length} sections`);
     return sections;
   }
 
   formatSectionName(name) {
-    return name
-      .split(/\s+/)
-      .map(word => word.charAt(0) + word.slice(1).toLowerCase())
-      .join(' ');
+    return name.split(/\s+/).map(word => word.charAt(0) + word.slice(1).toLowerCase()).join(' ');
   }
 
   extractTables(text) {
     const tables = [];
-    
-    // Pattern 1: Table headers with data
-    const tablePattern = /Table\s+(\d+)[^\n]*\n([\s\S]{50,1500}?)(?=\n\n|Table|\[|\d+\.\s+[A-Z])/gi;
+    const tablePattern = /Table\s+(\d+)[^\n]*\n([\s\S]{50,2000}?)(?=\n\n|Table|\[0\d+\])/gi;
     let match;
     
     while ((match = tablePattern.exec(text)) !== null) {
-      const tableNumber = match[1];
-      const tableContent = match[2].trim();
-      
       tables.push({
-        tableNumber: parseInt(tableNumber),
-        content: tableContent.replace(/\s+/g, ' '),
+        tableNumber: parseInt(match[1]),
+        content: match[2].trim().replace(/\s+/g, ' '),
         type: 'explicit'
       });
     }
     
-    // Pattern 2: Composition tables (mass%, wt%)
-    const compositionPattern = /(?:Component|Element|C|Si|Mn|Al|Cr|Cu|Ti|Ni|Fe)[\s\S]{10,50}?(?:mass%|wt%|%)[^\n]{10,200}\n(?:[^\n]{10,200}(?:mass%|wt%|%)[^\n]{10,200}\n){2,}/gi;
-    
-    while ((match = compositionPattern.exec(text)) !== null) {
-      const content = match[0].trim();
-      
-      // Check if not already captured
-      const isDuplicate = tables.some(t => t.content.includes(content.substring(0, 50)));
-      if (!isDuplicate && content.length > 50) {
-        tables.push({
-          tableNumber: tables.length + 1,
-          content: content.replace(/\s+/g, ' '),
-          type: 'composition'
-        });
-      }
-    }
-    
-    // Pattern 3: Data tables with multiple rows/columns
-    const dataTablePattern = /(?:[A-Za-z\s]+\s+[0-9.]+\s+[0-9.]+[^\n]{0,100}\n){3,}/g;
-    
-    while ((match = dataTablePattern.exec(text)) !== null) {
-      const content = match[0].trim();
-      
-      const isDuplicate = tables.some(t => 
-        t.content.substring(0, 100) === content.substring(0, 100)
-      );
-      
-      if (!isDuplicate && content.length > 100) {
-        tables.push({
-          tableNumber: tables.length + 1,
-          content: content.replace(/\s+/g, ' '),
-          type: 'data'
-        });
-      }
-    }
-    
-    console.log(`    Found ${tables.length} tables`);
-    return tables.slice(0, 20); // Limit to 20 tables
+    return tables.slice(0, 30);
   }
 
   extractCompositions(text) {
     const compositions = [];
-    
-    // Pattern for composition ranges: "2.5-4.0% Si"
-    const rangePattern = /([A-Z][a-z]?)\s*[:=]?\s*([0-9.]+)\s*(?:-|to|~)\s*([0-9.]+)\s*(?:mass%|wt%|%)/gi;
+    const rangePattern = /([A-Z][a-z]?)\s*[:=]?\s*([0-9.]+)\s*(?:%?\s*to\s*|[-~])\s*([0-9.]+)\s*(?:%|mass%|wt%)/gi;
     let match;
     
     while ((match = rangePattern.exec(text)) !== null) {
@@ -315,47 +387,16 @@ class PDFProcessor {
         element: match[1],
         min: parseFloat(match[2]),
         max: parseFloat(match[3]),
-        unit: 'mass%',
-        raw: match[0]
+        unit: 'mass%'
       });
     }
     
-    // Pattern for single values: "Si: 3.0%"
-    const singlePattern = /([A-Z][a-z]?)\s*[:=]\s*([0-9.]+)\s*(?:mass%|wt%|%)/gi;
-    
-    while ((match = singlePattern.exec(text)) !== null) {
-      const element = match[1];
-      const value = parseFloat(match[2]);
-      
-      // Don't duplicate range entries
-      const isDuplicate = compositions.some(c => 
-        c.element === element && value >= c.min && value <= c.max
-      );
-      
-      if (!isDuplicate) {
-        compositions.push({
-          element: element,
-          value: value,
-          unit: 'mass%',
-          raw: match[0]
-        });
-      }
-    }
-    
-    console.log(`    Found ${compositions.length} compositions`);
-    return compositions.slice(0, 30);
+    return compositions.slice(0, 50);
   }
 
   extractTechnicalDetails(text) {
-    const details = {
-      temperatures: [],
-      pressures: [],
-      thicknesses: [],
-      processes: []
-    };
-    
-    // Temperatures: "1050°C", "1050-1150°C"
-    const tempPattern = /([0-9]+)\s*(?:-|to)\s*([0-9]+)?\s*°C/gi;
+    const details = { temperatures: [], processes: [] };
+    const tempPattern = /(\d+)\s*(?:to\s+|-\s*)?(\d+)?\s*(?:°C|℃)/gi;
     let match;
     
     while ((match = tempPattern.exec(text)) !== null) {
@@ -363,136 +404,81 @@ class PDFProcessor {
         details.temperatures.push({
           min: parseInt(match[1]),
           max: parseInt(match[2]),
-          unit: '°C',
-          raw: match[0]
+          unit: '°C'
         });
       } else {
         details.temperatures.push({
           value: parseInt(match[1]),
-          unit: '°C',
-          raw: match[0]
+          unit: '°C'
         });
       }
     }
     
-    // Processes
-    const processKeywords = [
-      'hot rolling', 'cold rolling', 'annealing', 'quenching',
-      'tempering', 'heating', 'cooling', 'casting', 'forging'
-    ];
-    
-    processKeywords.forEach(keyword => {
-      const regex = new RegExp(`${keyword}[^.]{0,200}[.]`, 'gi');
-      const matches = [...text.matchAll(regex)];
-      
-      matches.forEach(m => {
-        details.processes.push({
-          type: keyword,
-          description: m[0].trim().substring(0, 200)
-        });
-      });
-    });
-    
-    console.log(`    Technical details: ${details.temperatures.length} temps, ${details.processes.length} processes`);
     return details;
   }
 
   extractKeywords(text) {
-    const lowerText = text.toLowerCase();
-    const keywords = [
-      'steel', 'magnetic', 'electrical', 'electromagnetic',
-      'silicon', 'chromium', 'aluminum', 'aluminium',
-      'manganese', 'copper', 'titanium', 'nickel', 'carbon',
-      'annealing', 'rolling', 'hot rolling', 'cold rolling',
-      'composition', 'temperature', 'manufacturing', 'process',
-      'sheet', 'grain', 'texture', 'core loss', 'magnetic flux',
-      'permeability', 'coercivity', 'saturation', 'hysteresis',
-      'non-oriented', 'grain-oriented', 'crystallographic',
-      'mechanical properties', 'tensile strength', 'hardness'
-    ];
+    const keywords = ['steel', 'magnetic', 'silicon', 'chromium', 'aluminum', 'annealing', 'rolling', 'composition'];
+    return keywords.filter(k => text.toLowerCase().includes(k));
+  }
 
-    const found = keywords.filter(k => lowerText.includes(k));
-    console.log(`    Keywords: ${found.length} found`);
-    return found;
+  extractClaims(text) {
+    const claims = [];
+    const claimsMatch = text.match(/Claims\s*\n([^]*?)(?=Description|Drawings|Figures|$)/i);
+    
+    if (claimsMatch) {
+      const claimsText = claimsMatch[1];
+      const claimPattern = /(\d+)\.\s*([^]*?)(?=\n\s*\d+\.|$)/g;
+      let match;
+      
+      while ((match = claimPattern.exec(claimsText)) !== null) {
+        claims.push({
+          number: parseInt(match[1]),
+          text: match[2].trim().replace(/\s+/g, ' ').substring(0, 2000)
+        });
+      }
+    }
+    
+    return claims;
   }
 
   async processAllPDFs() {
     console.log('\n🚀 Starting comprehensive PDF processing...\n');
-    
     await this.initialize();
     
     try {
-      try {
-        await fs.access(this.pdfDir);
-        console.log('✅ Uploads directory exists\n');
-      } catch (error) {
-        console.error(`❌ Uploads directory not found: ${this.pdfDir}`);
-        return;
-      }
-
+      await fs.access(this.pdfDir);
       const files = await fs.readdir(this.pdfDir);
       const pdfFiles = files.filter(f => f.toLowerCase().endsWith('.pdf'));
       
       if (pdfFiles.length === 0) {
-        console.log(`⚠️  No PDF files found in: ${this.pdfDir}\n`);
+        console.log(`⚠️  No PDF files found\n`);
         return;
       }
 
-      console.log(`📚 Found ${pdfFiles.length} PDF file(s):`);
-      pdfFiles.forEach((f, i) => console.log(`   ${i + 1}. ${f}`));
-      console.log('');
+      console.log(`📚 Found ${pdfFiles.length} PDF file(s)\n`);
 
       const allPatents = [];
-      let successCount = 0;
-      let failCount = 0;
-
       for (const file of pdfFiles) {
         try {
           const filePath = path.join(this.pdfDir, file);
           const patentData = await this.processPDF(filePath);
           allPatents.push(patentData);
-          successCount++;
-          console.log(`✅ Successfully processed: ${patentData.patentNumber}`);
+          console.log(`✅ ${patentData.patentNumber}\n`);
         } catch (error) {
-          failCount++;
-          console.error(`❌ Failed to process: ${file}`);
-          console.error(`   Error: ${error.message}`);
+          console.error(`❌ Failed: ${file}\n`);
         }
-      }
-
-      if (allPatents.length === 0) {
-        console.log('\n❌ No patents were successfully processed\n');
-        return;
       }
 
       const outputPath = path.join(this.processedDir, 'patents.json');
       await fs.writeFile(outputPath, JSON.stringify(allPatents, null, 2), 'utf8');
-
+      
       console.log(`\n${'='.repeat(70)}`);
-      console.log('📊 PROCESSING SUMMARY');
-      console.log(`${'='.repeat(70)}`);
-      console.log(`✅ Success: ${successCount} patents`);
-      console.log(`❌ Failed:  ${failCount} patents`);
-      console.log(`💾 Saved to: ${outputPath}`);
+      console.log(`💾 SUCCESS: Saved ${allPatents.length} patents`);
       console.log(`${'='.repeat(70)}\n`);
-
-      console.log('📋 Processed Patents:\n');
-      allPatents.forEach((p, i) => {
-        console.log(`${i + 1}. ${p.patentNumber}`);
-        console.log(`   Title:        ${p.title}`);
-        console.log(`   Pages:        ${p.numPages}`);
-        console.log(`   Text length:  ${p.textLength.toLocaleString()} chars`);
-        console.log(`   Sections:     ${p.sections.length}`);
-        console.log(`   Tables:       ${p.tables.length}`);
-        console.log(`   Compositions: ${p.compositions.length}`);
-        console.log(`   Temperatures: ${p.technicalDetails.temperatures.length}`);
-        console.log(`   Keywords:     ${p.keywords.length}`);
-        console.log('');
-      });
-
+      
     } catch (error) {
       console.error('\n❌ Fatal Error:', error.message);
-      console.error(error.stack);
     }
   }
 
@@ -502,14 +488,9 @@ class PDFProcessor {
       await fs.access(filePath);
       const data = await fs.readFile(filePath, 'utf8');
       const patents = JSON.parse(data);
-      console.log(`📚 Loaded ${patents.length} patent(s) from cache`);
+      console.log(`📚 Loaded ${patents.length} patents`);
       return patents;
     } catch (error) {
-      if (error.code === 'ENOENT') {
-        console.log('⚠️  No processed patents found. Run: npm run process');
-      } else {
-        console.error('❌ Error loading patents:', error.message);
-      }
       return [];
     }
   }
@@ -519,11 +500,11 @@ if (require.main === module) {
   const processor = new PDFProcessor();
   processor.processAllPDFs()
     .then(() => {
-      console.log('✅ Processing complete!\n');
+      console.log('✅ Complete!\n');
       process.exit(0);
     })
     .catch(error => {
-      console.error('❌ Processing failed:', error);
+      console.error('❌ Failed:', error);
       process.exit(1);
     });
 }

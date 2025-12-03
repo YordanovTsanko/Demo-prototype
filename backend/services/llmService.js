@@ -2,52 +2,41 @@ const Groq = require('groq-sdk');
 
 class LLMService {
   constructor() {
-    if (!process.env.GROQ_API_KEY) {
-      console.warn('⚠️  GROQ_API_KEY not set - LLM features will not work');
-    }
     this.groq = new Groq({
       apiKey: process.env.GROQ_API_KEY || 'dummy-key'
     });
-    
-    // Available models as of 2024
-    this.availableModels = [
-      'llama-3.3-70b-versatile',      // Latest, best quality
-      'llama-3.1-8b-instant',          // Fast, good for demos
-      'mixtral-8x7b-32768',            // Good alternative
-      'gemma2-9b-it'                   // Another option
-    ];
-    
-    this.currentModel = 'llama-3.3-70b-versatile'; // Use latest
-    console.log(`🤖 Using LLM model: ${this.currentModel}`);
+    this.currentModel = 'llama-3.3-70b-versatile';
+    console.log(`🤖 LLM model: ${this.currentModel}`);
   }
 
   async answerQuestion(patent, question) {
     try {
-      console.log(`\n💬 Question: "${question}"`);
+      console.log(`\n💬 Q: "${question}"`);
       console.log(`📄 Patent: ${patent.patentNumber}`);
 
-      const prompt = this.buildPrompt(patent, question);
+      // Find relevant paragraphs first
+      const relevantParagraphs = this.findRelevantParagraphs(patent, question);
+      console.log(`📋 Found ${relevantParagraphs.length} relevant paragraphs`);
+
+      const prompt = this.buildPrompt(patent, question, relevantParagraphs);
 
       const completion = await this.groq.chat.completions.create({
         messages: [
           {
             role: 'system',
-            content: `You are a patent analysis assistant. Answer questions based ONLY on the provided patent information.
+            content: `You are a patent analysis expert. You MUST follow these rules:
 
-CRITICAL RULES:
-1. Answer MUST be based on the patent content provided
-2. Keep answer concise (2-3 sentences, max 400 characters)
-3. Always mention specific technical details (compositions, temperatures, processes)
-4. Reference the section name naturally in your answer
-5. Be precise and technical
+MANDATORY RULES:
+1. You MUST reference specific paragraph numbers like [0001], [0025], [0045] in EVERY answer
+2. Start your answer with: "According to paragraph [XXXX]..."
+3. Include exact technical values (percentages, temperatures, dimensions)
+4. If information spans multiple paragraphs, reference all of them: "[0001] states... while [0045] describes..."
+5. NEVER give generic answers - always cite specific paragraphs
 
-Example good answer:
-"The steel sheet contains 2.5-4.0% Si and 0.5-2.0% Al (Technical Field, Page 1). Hot rolling is performed at 1050-1150°C followed by cold rolling (Description of Embodiments, Page 5)."
+EXAMPLE FORMAT:
+"According to [0001], the steel contains 2.5-10% Si and 1.5-20% Cr by mass. Paragraph [0012] explains that this composition provides high electrical resistivity of 60μΩcm or more. The manufacturing process in [0045] specifies hot rolling at 1050-1250°C."
 
-DO NOT:
-- Make up information not in the patent
-- Give generic answers
-- Use vague language`
+If you don't cite paragraph markers, your answer is WRONG.`
           },
           {
             role: 'user',
@@ -55,322 +44,297 @@ DO NOT:
           }
         ],
         model: this.currentModel,
-        temperature: 0.2,
-        max_tokens: 400,
+        temperature: 0.05, // Very low for consistency
+        max_tokens: 800,
         top_p: 0.9
       });
 
       const answer = completion.choices[0]?.message?.content || 'No answer generated';
-      console.log(`🤖 Answer: ${answer.substring(0, 100)}...`);
+      console.log(`🤖 A: ${answer.substring(0, 200)}...`);
 
-      const citations = this.extractCitations(patent, question, answer);
-      console.log(`📚 Citations: ${citations.length} found`);
+      // Extract citations from answer
+      const citations = this.extractCitations(patent, answer, relevantParagraphs);
+      console.log(`📚 Citations: ${citations.length}`);
+      citations.forEach(c => console.log(`   - ${c.section}`));
+      console.log('');
 
-      return { 
-        answer: answer.trim(), 
-        citations 
-      };
+      return { answer: answer.trim(), citations };
 
     } catch (error) {
       console.error('❌ LLM Error:', error.message);
       
-      // If model is deprecated, try fallback models
-      if (error.message.includes('decommissioned') || error.message.includes('deprecated')) {
-        console.log('⚠️  Current model deprecated, trying fallback...');
+      if (error.message.includes('decommissioned')) {
         return await this.answerWithFallbackModel(patent, question);
       }
       
-      if (error.message.includes('API key') || error.message.includes('401')) {
-        throw new Error('LLM API key not configured. Please set GROQ_API_KEY in .env file');
-      }
-      
-      // Use pattern-based fallback
-      console.log('⚠️  Using pattern-based fallback');
       return this.getFallbackAnswer(patent, question);
     }
   }
 
-  async answerWithFallbackModel(patent, question) {
-    // Try each model until one works
-    for (const model of this.availableModels) {
-      if (model === this.currentModel) continue; // Skip the one that failed
-      
-      try {
-        console.log(`   Trying model: ${model}`);
-        
-        const prompt = this.buildPrompt(patent, question);
-        
-        const completion = await this.groq.chat.completions.create({
-          messages: [
-            {
-              role: 'system',
-              content: 'You are a patent analysis assistant. Answer based ONLY on the provided patent. Be concise and technical.'
-            },
-            {
-              role: 'user',
-              content: prompt
-            }
-          ],
-          model: model,
-          temperature: 0.2,
-          max_tokens: 400
-        });
-
-        const answer = completion.choices[0]?.message?.content || 'No answer generated';
-        const citations = this.extractCitations(patent, question, answer);
-        
-        console.log(`   ✅ Success with ${model}`);
-        this.currentModel = model; // Update to working model
-        
-        return { answer: answer.trim(), citations };
-        
-      } catch (err) {
-        console.log(`   ❌ ${model} failed: ${err.message}`);
-        continue;
-      }
+  findRelevantParagraphs(patent, question) {
+    if (!patent.numberedParagraphs || patent.numberedParagraphs.length === 0) {
+      return [];
     }
-    
-    // All models failed, use pattern-based
-    console.log('⚠️  All LLM models failed, using pattern-based fallback');
-    return this.getFallbackAnswer(patent, question);
+
+    const questionLower = question.toLowerCase();
+    const keywords = questionLower
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !['what', 'how', 'why', 'when', 'where', 'which', 'does', 'this', 'that', 'about'].includes(w));
+
+    // Score each paragraph
+    const scored = patent.numberedParagraphs.map(para => {
+      const contentLower = para.content.toLowerCase();
+      
+      // Count keyword matches
+      let score = 0;
+      keywords.forEach(kw => {
+        const count = (contentLower.match(new RegExp(kw, 'g')) || []).length;
+        score += count * 2;
+      });
+
+      // Bonus for composition questions
+      if (questionLower.match(/composition|contain|component|element|material/)) {
+        if (contentLower.match(/mass%|wt%|contains|composition|balance/)) {
+          score += 5;
+        }
+      }
+
+      // Bonus for process questions
+      if (questionLower.match(/process|method|manufactur|produc|how/)) {
+        if (contentLower.match(/rolling|heating|cooling|annealing|temperature|process|method/)) {
+          score += 5;
+        }
+      }
+
+      // Bonus for property questions
+      if (questionLower.match(/property|properties|characteristic|advantage|effect|benefit/)) {
+        if (contentLower.match(/property|properties|advantage|effect|excellent|improved|characteristic/)) {
+          score += 5;
+        }
+      }
+
+      return { para, score };
+    });
+
+    // Get top 10 most relevant paragraphs
+    const relevant = scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10)
+      .map(s => s.para);
+
+    // Sort by paragraph number
+    relevant.sort((a, b) => a.number - b.number);
+
+    return relevant;
   }
 
-  buildPrompt(patent, question) {
-    // Build comprehensive prompt with all extracted data
-    let prompt = `Patent Document: ${patent.patentNumber}
+  buildPrompt(patent, question, relevantParagraphs) {
+    let prompt = `PATENT DOCUMENT: ${patent.patentNumber}
 Title: ${patent.title}
 
-Abstract (Page 1):
+ABSTRACT:
 ${patent.abstract}
 
 `;
 
-    // Add sections
-    if (patent.sections && patent.sections.length > 0) {
-      prompt += 'Detailed Sections:\n';
-      patent.sections.slice(0, 5).forEach(s => {
-        prompt += `[${s.name} - Page ${s.page}]\n${s.content.substring(0, 800)}\n\n`;
+    // Add the most relevant paragraphs with their markers
+    if (relevantParagraphs.length > 0) {
+      prompt += `RELEVANT PARAGRAPHS (you MUST reference these markers in your answer):\n\n`;
+      
+      relevantParagraphs.forEach(para => {
+        prompt += `${para.marker} ${para.content}\n\n`;
+      });
+    } else if (patent.numberedParagraphs && patent.numberedParagraphs.length > 0) {
+      // Fallback: use first 15 paragraphs
+      prompt += `DETAILED DESCRIPTION (you MUST reference these markers):\n\n`;
+      patent.numberedParagraphs.slice(0, 15).forEach(para => {
+        prompt += `${para.marker} ${para.content}\n\n`;
       });
     }
 
-    // Add compositions if available
+    // Add composition data if available
     if (patent.compositions && patent.compositions.length > 0) {
-      prompt += '\nComposition Details:\n';
+      prompt += `COMPOSITION DATA:\n`;
       patent.compositions.slice(0, 10).forEach(c => {
         if (c.min && c.max) {
-          prompt += `${c.element}: ${c.min}-${c.max}${c.unit}\n`;
+          prompt += `- ${c.element}: ${c.min}-${c.max}${c.unit}\n`;
         } else if (c.value) {
-          prompt += `${c.element}: ${c.value}${c.unit}\n`;
+          prompt += `- ${c.element}: ${c.value}${c.unit}\n`;
         }
-      });
-      prompt += '\n';
-    }
-
-    // Add tables if available
-    if (patent.tables && patent.tables.length > 0) {
-      prompt += '\nTables:\n';
-      patent.tables.slice(0, 2).forEach(t => {
-        prompt += `Table ${t.tableNumber}: ${t.content.substring(0, 300)}\n`;
       });
       prompt += '\n';
     }
 
     // Add technical details
-    if (patent.technicalDetails) {
-      if (patent.technicalDetails.temperatures.length > 0) {
-        prompt += '\nTemperatures:\n';
-        patent.technicalDetails.temperatures.slice(0, 5).forEach(t => {
-          prompt += `${t.raw}\n`;
-        });
-        prompt += '\n';
-      }
-      
-      if (patent.technicalDetails.processes.length > 0) {
-        prompt += '\nProcesses:\n';
-        patent.technicalDetails.processes.slice(0, 5).forEach(p => {
-          prompt += `${p.type}: ${p.description.substring(0, 150)}\n`;
-        });
-        prompt += '\n';
-      }
+    if (patent.technicalDetails && patent.technicalDetails.temperatures && patent.technicalDetails.temperatures.length > 0) {
+      prompt += `TEMPERATURE DATA:\n`;
+      patent.technicalDetails.temperatures.slice(0, 5).forEach(t => {
+        if (t.min && t.max) {
+          prompt += `- ${t.min}-${t.max}${t.unit}\n`;
+        } else if (t.value) {
+          prompt += `- ${t.value}${t.unit}\n`;
+        }
+      });
+      prompt += '\n';
     }
 
-    prompt += `Keywords: ${patent.keywords.join(', ')}\n\n`;
-    prompt += `Question: ${question}\n\n`;
-    prompt += `Provide a precise, technical answer based on the patent content above. Include specific values, compositions, or process parameters when available.`;
+    prompt += `QUESTION: ${question}
+
+INSTRUCTIONS:
+1. You MUST start your answer with "According to paragraph [XXXX]..."
+2. Reference specific paragraph markers throughout your answer
+3. Include exact technical values from the paragraphs
+4. Cite multiple paragraphs if relevant
+5. Keep answer concise but technically complete (max 600 characters)
+
+YOUR ANSWER (must include paragraph markers):`;
 
     return prompt;
   }
 
-  extractCitations(patent, question, answer) {
+  extractCitations(patent, answer, relevantParagraphs) {
     const citations = [];
-    const answerLower = answer.toLowerCase();
-    const questionLower = question.toLowerCase();
+    const citationMap = new Map();
 
-    // Strategy 1: Sections mentioned in answer
-    if (patent.sections) {
-      patent.sections.forEach(section => {
-        const sectionNameLower = section.name.toLowerCase();
-        const keywords = sectionNameLower.split(' ');
-        
-        if (keywords.some(word => word.length > 4 && answerLower.includes(word))) {
-          citations.push({
+    // Extract all paragraph markers mentioned in the answer
+    const paraMatches = [...answer.matchAll(/\[0*(\d+)\]/g)];
+    
+    console.log(`   Extracting from answer: found ${paraMatches.length} paragraph references`);
+
+    paraMatches.forEach(match => {
+      const paraNum = parseInt(match[1]);
+      const key = `para-${paraNum}`;
+      
+      if (!citationMap.has(key) && patent.numberedParagraphs) {
+        const para = patent.numberedParagraphs.find(p => p.number === paraNum);
+        if (para) {
+          citationMap.set(key, {
             patentId: patent.patentNumber,
-            page: section.page,
-            section: section.name
+            page: Math.max(1, Math.ceil(paraNum / 5)),
+            section: `Paragraph ${para.marker}`,
+            paragraphNumber: paraNum,
+            type: 'paragraph'
           });
         }
-      });
-    }
+      }
+    });
 
-    // Strategy 2: Question keywords to sections
-    const questionKeywords = this.extractQuestionKeywords(questionLower);
-    if (patent.sections) {
-      patent.sections.forEach(section => {
-        const contentLower = section.content.toLowerCase();
-        const matchCount = questionKeywords.filter(kw => contentLower.includes(kw)).length;
-        
-        if (matchCount >= 2) {
-          const existing = citations.find(c => c.page === section.page);
-          if (!existing) {
-            citations.push({
-              patentId: patent.patentNumber,
-              page: section.page,
-              section: section.name
-            });
-          }
-        }
-      });
-    }
-
-    // Strategy 3: Overview questions - cite abstract
-    if (questionLower.match(/what is|about|describe|overview|summary/)) {
-      const hasAbstract = citations.some(c => c.page === 1);
-      if (!hasAbstract) {
-        citations.unshift({
+    // If no paragraphs cited in answer but we have relevant paragraphs, use those
+    if (citationMap.size === 0 && relevantParagraphs && relevantParagraphs.length > 0) {
+      console.log(`   No paragraphs in answer, using ${relevantParagraphs.length} relevant paragraphs`);
+      
+      relevantParagraphs.slice(0, 3).forEach(para => {
+        const key = `para-${para.number}`;
+        citationMap.set(key, {
           patentId: patent.patentNumber,
-          page: 1,
-          section: 'Abstract'
+          page: Math.max(1, Math.ceil(para.number / 5)),
+          section: `Paragraph ${para.marker}`,
+          paragraphNumber: para.number,
+          type: 'paragraph'
         });
-      }
+      });
     }
 
-    // Strategy 4: Technical questions
-    if (questionLower.match(/composition|component|contain|material|element|table/)) {
-      if (patent.sections) {
-        const technicalSection = patent.sections.find(s => 
-          s.name.toLowerCase().includes('technical') || 
-          s.name.toLowerCase().includes('embodiment') ||
-          s.name.toLowerCase().includes('example')
-        );
-        if (technicalSection) {
-          const existing = citations.find(c => c.section === technicalSection.name);
-          if (!existing) {
-            citations.push({
-              patentId: patent.patentNumber,
-              page: technicalSection.page,
-              section: technicalSection.name
-            });
-          }
-        }
-      }
+    // If still nothing, use abstract
+    if (citationMap.size === 0) {
+      citationMap.set('abstract', {
+        patentId: patent.patentNumber,
+        page: 1,
+        section: 'Abstract',
+        type: 'abstract'
+      });
     }
 
-    // Remove duplicates and limit to 3
-    const unique = citations.filter((citation, index, self) =>
-      index === self.findIndex(c => 
-        c.page === citation.page && c.section === citation.section
-      )
-    );
+    citations.push(...citationMap.values());
 
-    return unique.slice(0, 3);
+    // Sort by paragraph number
+    citations.sort((a, b) => {
+      if (a.paragraphNumber && b.paragraphNumber) {
+        return a.paragraphNumber - b.paragraphNumber;
+      }
+      return 0;
+    });
+
+    return citations.slice(0, 5);
   }
 
-  extractQuestionKeywords(question) {
-    const stopWords = ['what', 'how', 'why', 'when', 'where', 'is', 'are', 'the', 'a', 'an', 'of', 'in', 'to', 'for', 'and', 'or', 'this', 'that'];
-    const words = question.toLowerCase().split(/\s+/);
-    return words.filter(w => w.length > 3 && !stopWords.includes(w));
+  async answerWithFallbackModel(patent, question) {
+    const models = ['llama-3.1-8b-instant', 'mixtral-8x7b-32768'];
+    
+    for (const model of models) {
+      try {
+        console.log(`   Trying ${model}...`);
+        
+        const relevantParagraphs = this.findRelevantParagraphs(patent, question);
+        const prompt = this.buildPrompt(patent, question, relevantParagraphs);
+        
+        const completion = await this.groq.chat.completions.create({
+          messages: [
+            { 
+              role: 'system', 
+              content: 'You MUST cite specific paragraph markers [0001], [0025] etc. in your answer. Start with "According to paragraph [XXXX]..."' 
+            },
+            { role: 'user', content: prompt }
+          ],
+          model: model,
+          temperature: 0.05,
+          max_tokens: 800
+        });
+
+        const answer = completion.choices[0]?.message?.content || 'No answer';
+        this.currentModel = model;
+        console.log(`   ✅ Success with ${model}`);
+        
+        return { 
+          answer: answer.trim(), 
+          citations: this.extractCitations(patent, answer, relevantParagraphs) 
+        };
+        
+      } catch (err) {
+        console.log(`   ❌ ${model} failed: ${err.message}`);
+      }
+    }
+    
+    return this.getFallbackAnswer(patent, question);
   }
 
   getFallbackAnswer(patent, question) {
-    const lowerQ = question.toLowerCase();
-    let answer = '';
-    const citations = [];
-
-    if (lowerQ.match(/what is|about|describe|overview/)) {
-      answer = patent.abstract;
-      citations.push({
-        patentId: patent.patentNumber,
-        page: 1,
-        section: 'Abstract'
-      });
-    } else if (lowerQ.match(/composition|component|contain|material|element/)) {
-      if (patent.compositions && patent.compositions.length > 0) {
-        answer = `The patent describes compositions including: `;
-        patent.compositions.slice(0, 5).forEach(c => {
-          if (c.min && c.max) {
-            answer += `${c.element}: ${c.min}-${c.max}${c.unit}, `;
-          } else if (c.value) {
-            answer += `${c.element}: ${c.value}${c.unit}, `;
-          }
-        });
-      } else if (patent.sections) {
-        const techSection = patent.sections.find(s => 
-          s.content.match(/mass%|wt%|percent|composition/i)
-        );
-        if (techSection) {
-          answer = techSection.content.substring(0, 400);
-          citations.push({
-            patentId: patent.patentNumber,
-            page: techSection.page,
-            section: techSection.name
-          });
-        }
+    console.log('   Using fallback answer with paragraph search');
+    
+    const relevantParagraphs = this.findRelevantParagraphs(patent, question);
+    
+    if (relevantParagraphs.length > 0) {
+      const para = relevantParagraphs[0];
+      let answer = `According to ${para.marker}, ${para.content.substring(0, 400)}`;
+      
+      // Add second paragraph if available
+      if (relevantParagraphs.length > 1) {
+        const para2 = relevantParagraphs[1];
+        answer += ` Additionally, ${para2.marker} states: ${para2.content.substring(0, 200)}`;
       }
-    } else if (lowerQ.match(/process|method|manufactur|produc|temperature/)) {
-      if (patent.technicalDetails && patent.technicalDetails.processes.length > 0) {
-        answer = patent.technicalDetails.processes[0].description;
-        citations.push({
+      
+      return {
+        answer: answer.substring(0, 600) + '...',
+        citations: relevantParagraphs.slice(0, 3).map(p => ({
           patentId: patent.patentNumber,
-          page: 3,
-          section: 'Process Description'
-        });
-      } else if (patent.sections) {
-        const processSection = patent.sections.find(s => 
-          s.name.toLowerCase().includes('embodiment') ||
-          s.name.toLowerCase().includes('example')
-        );
-        if (processSection) {
-          answer = processSection.content.substring(0, 400);
-          citations.push({
-            patentId: patent.patentNumber,
-            page: processSection.page,
-            section: processSection.name
-          });
-        }
-      }
-    } else if (lowerQ.match(/table/)) {
-      if (patent.tables && patent.tables.length > 0) {
-        answer = `The patent contains ${patent.tables.length} tables. ` + patent.tables[0].content.substring(0, 300);
-        citations.push({
-          patentId: patent.patentNumber,
-          page: 2,
-          section: 'Tables'
-        });
-      }
+          page: Math.max(1, Math.ceil(p.number / 5)),
+          section: `Paragraph ${p.marker}`,
+          paragraphNumber: p.number,
+          type: 'paragraph'
+        }))
+      };
     }
-
-    if (!answer) {
-      answer = patent.abstract;
-      citations.push({
-        patentId: patent.patentNumber,
-        page: 1,
-        section: 'Abstract'
-      });
-    }
-
+    
+    // Final fallback
     return {
-      answer: answer.substring(0, 400) + '...',
-      citations
+      answer: patent.abstract.substring(0, 500),
+      citations: [{ 
+        patentId: patent.patentNumber, 
+        page: 1, 
+        section: 'Abstract',
+        type: 'abstract'
+      }]
     };
   }
 }

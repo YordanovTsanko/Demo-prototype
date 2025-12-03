@@ -1,26 +1,17 @@
 const express = require('express');
 const router = express.Router();
+const path = require('path');
+const fs = require('fs');
 const pdfProcessor = require('../services/pdfProcessor');
 const llmService = require('../services/llmService');
 
 let patents = [];
-let isLoading = false;
 
 async function loadPatents() {
-  if (isLoading) return;
-  isLoading = true;
-  
-  try {
-    patents = await pdfProcessor.loadProcessedPatents();
-    console.log(`📚 Loaded ${patents.length} patents into memory`);
-  } catch (error) {
-    console.error('❌ Error loading patents:', error);
-  } finally {
-    isLoading = false;
-  }
+  patents = await pdfProcessor.loadProcessedPatents();
+  console.log(`📚 Loaded ${patents.length} patents into memory`);
 }
 
-// Load patents on startup
 loadPatents();
 
 // GET all patents (summary)
@@ -40,6 +31,11 @@ router.get('/patents', (req, res) => {
       abstract: p.abstract.substring(0, 250) + '...',
       keywords: p.keywords,
       sectionsCount: p.sections.length,
+      tablesCount: p.tables?.length || 0,
+      compositionsCount: p.compositions?.length || 0,
+      numPages: p.numPages,
+      fileSize: p.fileSize,
+      pdfAvailable: p.pdfAvailable || false,
       processedAt: p.processedAt
     }));
     
@@ -64,7 +60,6 @@ router.get('/patents/:id', (req, res) => {
       });
     }
     
-    // Return without fullText to save bandwidth
     const { fullText, ...patentData } = patent;
     
     res.json({
@@ -76,26 +71,62 @@ router.get('/patents/:id', (req, res) => {
     res.status(500).json({ error: 'Failed to fetch patent details' });
   }
 });
-// POST chat - Answer question about a patent
+
+// DOWNLOAD PDF file from /uploads
+router.get('/patents/:id/download', async (req, res) => {
+  try {
+    const patent = patents.find(p => 
+      p.patentNumber === req.params.id || 
+      p.patentNumber.replace(/\s/g, '') === req.params.id.replace(/\s/g, '')
+    );
+    
+    if (!patent) {
+      return res.status(404).json({ error: 'Patent not found' });
+    }
+
+    if (!patent.pdfAvailable || !patent.originalFileName) {
+      return res.status(404).json({ error: 'PDF file not available' });
+    }
+
+    // Serve from uploads directory
+    const pdfPath = path.join(__dirname, '../uploads', patent.originalFileName);
+    
+    if (!fs.existsSync(pdfPath)) {
+      return res.status(404).json({ error: 'PDF file not found on server' });
+    }
+
+    console.log(`📥 Downloading PDF: ${patent.patentNumber} (${patent.originalFileName})`);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${patent.patentNumber}.pdf"`);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    
+    const fileStream = fs.createReadStream(pdfPath);
+    fileStream.pipe(res);
+
+    fileStream.on('error', (error) => {
+      console.error('Error streaming PDF:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error downloading PDF' });
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in GET /patents/:id/download:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to download PDF' });
+    }
+  }
+});
+
+// POST chat
 router.post('/chat', async (req, res) => {
   try {
     const { patentId, question } = req.body;
 
-    console.log('📥 Chat request received:', { patentId, question });
-
-    // Validation
     if (!patentId || !question) {
-      console.error('❌ Missing required fields:', { 
-        hasPatentId: !!patentId, 
-        hasQuestion: !!question,
-        body: req.body 
-      });
       return res.status(400).json({ 
-        error: 'Both patentId and question are required',
-        received: { 
-          patentId: patentId || null, 
-          question: question || null 
-        }
+        error: 'Both patentId and question are required'
       });
     }
 
@@ -105,13 +136,6 @@ router.post('/chat', async (req, res) => {
       });
     }
 
-    if (question.length > 500) {
-      return res.status(400).json({ 
-        error: 'Question must be less than 500 characters' 
-      });
-    }
-
-    // Find patent
     const patent = patents.find(p => 
       p.patentNumber === patentId || 
       p.id === patentId ||
@@ -119,27 +143,14 @@ router.post('/chat', async (req, res) => {
     );
 
     if (!patent) {
-      console.error('❌ Patent not found:', patentId);
-      console.log('Available patents:', patents.map(p => p.patentNumber));
-      return res.status(404).json({ 
-        error: `Patent ${patentId} not found`,
-        availablePatents: patents.map(p => p.patentNumber)
-      });
+      return res.status(404).json({ error: `Patent ${patentId} not found` });
     }
 
-    console.log(`\n${'='.repeat(60)}`);
-    console.log(`📝 Chat Request`);
-    console.log(`Patent: ${patent.patentNumber}`);
-    console.log(`Question: ${question}`);
-    console.log(`${'='.repeat(60)}`);
+    console.log(`\n📝 Chat: ${patent.patentNumber} - "${question}"`);
 
-    // Get LLM answer with citations
     const result = await llmService.answerQuestion(patent, question);
 
-    console.log(`✅ Response generated`);
-    console.log(`Answer length: ${result.answer.length} chars`);
-    console.log(`Citations: ${result.citations.length}`);
-    console.log(`${'='.repeat(60)}\n`);
+    console.log(`✅ Response: ${result.answer.substring(0, 100)}...\n`);
 
     res.json({
       answer: result.answer,
@@ -149,12 +160,9 @@ router.post('/chat', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('\n❌ Chat Error:', error.message);
-    console.error(error.stack);
-    
+    console.error('❌ Chat Error:', error.message);
     res.status(500).json({ 
-      error: error.message || 'Failed to process question',
-      type: error.name
+      error: error.message || 'Failed to process question'
     });
   }
 });
