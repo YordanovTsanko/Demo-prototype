@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import MessageBubble from './MessageBubble';
 import QuestionInput from './QuestionInput';
 import { useChatMutation } from '../hooks/usePatents';
@@ -6,6 +6,17 @@ import { useChatMutation } from '../hooks/usePatents';
 const ChatArea = ({ selectedPatent }) => {
   const [messages, setMessages] = useState([]);
   const chatMutation = useChatMutation();
+  const messagesEndRef = useRef(null);
+  const messagesContainerRef = useRef(null);
+
+  // Auto-scroll to bottom when new messages arrive
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   const handleQuestionSubmit = async (values, formikBag) => {
     if (!selectedPatent) return;
@@ -22,7 +33,7 @@ const ChatArea = ({ selectedPatent }) => {
     setMessages(prev => [...prev, userMessage]);
 
     try {
-      // FIXED: Use patentNumber instead of _id
+      // Use patentNumber instead of _id
       const response = await chatMutation.mutateAsync({
         patentId: selectedPatent.patentNumber || selectedPatent.id,
         question,
@@ -73,9 +84,9 @@ const ChatArea = ({ selectedPatent }) => {
   }
 
   return (
-    <div className="flex-1 flex flex-col bg-white">
+    <div className="flex-1 flex flex-col bg-white h-full overflow-hidden">
       {/* Header */}
-      <div className="border-b border-gray-200 bg-white px-6 py-4">
+      <div className="flex-shrink-0 border-b border-gray-200 bg-white px-6 py-4">
         <h2 className="text-lg font-semibold text-gray-800 truncate">
           {selectedPatent.patentNumber || selectedPatent.id}
         </h2>
@@ -84,10 +95,18 @@ const ChatArea = ({ selectedPatent }) => {
         </p>
       </div>
 
-      {/* Messages Area */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+      {/* Messages Area - Scrollable */}
+      <div 
+        ref={messagesContainerRef}
+        className="flex-1 overflow-y-auto px-6 py-4 space-y-4"
+        style={{ 
+          maxHeight: 'calc(100vh - 280px)',
+          overflowY: 'auto',
+          scrollBehavior: 'smooth'
+        }}
+      >
         {messages.length === 0 ? (
-          <div className="flex items-center justify-center h-full">
+          <div className="flex items-center justify-center h-full min-h-[300px]">
             <div className="text-center max-w-md">
               <p className="text-gray-500 mb-4">
                 Ask me anything about this patent! For example:
@@ -101,32 +120,37 @@ const ChatArea = ({ selectedPatent }) => {
             </div>
           </div>
         ) : (
-          messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
-          ))
-        )}
-        
-        {/* Loading indicator */}
-        {chatMutation.isPending && (
-          <div className="flex items-start space-x-3">
-            <div className="w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center flex-shrink-0">
-              <svg className="w-5 h-5 text-primary-600" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>
-              </svg>
-            </div>
-            <div className="flex-1 bg-gray-50 rounded-lg px-4 py-3">
-              <div className="flex items-center space-x-2">
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+          <>
+            {messages.map((message) => (
+              <MessageBubble key={message.id} message={message} />
+            ))}
+            
+            {/* Loading indicator */}
+            {chatMutation.isPending && (
+              <div className="flex items-start space-x-3">
+                <div className="w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center flex-shrink-0">
+                  <svg className="w-5 h-5 text-primary-600" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/>
+                  </svg>
+                </div>
+                <div className="flex-1 bg-gray-50 rounded-lg px-4 py-3">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                    <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
+            )}
+            
+            {/* Scroll anchor */}
+            <div ref={messagesEndRef} />
+          </>
         )}
       </div>
 
-      {/* Input Area */}
-      <div className="border-t border-gray-200 px-6 py-4 bg-gray-50">
+      {/* Input Area - Fixed at bottom */}
+      <div className="flex-shrink-0 border-t border-gray-200 px-6 py-4 bg-gray-50">
         <QuestionInput
           onSubmit={handleQuestionSubmit}
           disabled={chatMutation.isPending}

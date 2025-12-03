@@ -11,27 +11,39 @@ const validationSchema = Yup.object({
 });
 
 const QuestionInput = ({ onSubmit, disabled }) => {
+  const handleKeyDown = (e, submitForm) => {
+    // Submit on Enter (without Shift)
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitForm();
+    }
+  };
+
   return (
     <Formik
       initialValues={{ question: '' }}
       validationSchema={validationSchema}
       onSubmit={onSubmit}
     >
-      {({ values, errors, touched, isSubmitting }) => (
+      {({ values, errors, touched, isSubmitting, submitForm }) => (
         <Form className="space-y-2">
           <div className="relative">
-            <Field
-              name="question"
-              as="textarea"
-              rows="3"
-              placeholder="Ask a question about this patent..."
-              disabled={disabled || isSubmitting}
-              className={`w-full px-4 py-3 border rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed ${
-                errors.question && touched.question
-                  ? 'border-red-300'
-                  : 'border-gray-300'
-              }`}
-            />
+            <Field name="question">
+              {({ field }) => (
+                <textarea
+                  {...field}
+                  rows="3"
+                  placeholder="Ask a question about this patent..."
+                  disabled={disabled || isSubmitting}
+                  onKeyDown={(e) => handleKeyDown(e, submitForm)}
+                  className={`w-full px-4 py-3 border rounded-lg resize-none focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed ${
+                    errors.question && touched.question
+                      ? 'border-red-300'
+                      : 'border-gray-300'
+                  }`}
+                />
+              )}
+            </Field>
             <div className="absolute bottom-3 right-3 text-xs text-gray-400">
               {values.question.length}/500
             </div>

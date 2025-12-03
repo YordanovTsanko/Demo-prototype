@@ -60,7 +60,7 @@ const ChatPage = () => {
                 Patent Chat Demo
               </h1>
               <p className="text-sm text-gray-500 mt-1">
-                Ask questions about patents in natural language
+                Explore and understand patents
               </p>
             </div>
             <div className="flex items-center gap-2 px-3 py-1 bg-yellow-50 border border-yellow-200 rounded-lg">
