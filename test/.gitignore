@@ -1,0 +1,77 @@
+# ------------------------
+# Node Modules (frontend + backend)
+# ------------------------
+**/node_modules/
+
+# Yarn / pnpm PnP
+.pnp/
+.pnp.js
+.pnp.cjs
+
+# ------------------------
+# Build / Output
+# ------------------------
+# React build
+frontend/build/
+
+# Node build (TypeScript or bundlers)
+backend/dist/
+backend/build/
+
+# General build folders
+**/dist/
+**/build/
+**/.next/
+**/.vite/
+**/.parcel-cache/
+
+# TS build info
+*.tsbuildinfo
+
+# ------------------------
+# Environment variables (DO NOT COMMIT SECRETS)
+# ------------------------
+.env
+.env.local
+.env.*.local
+frontend/.env
+backend/.env
+
+# ------------------------
+# Logs
+# ------------------------
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# ------------------------
+# Test / Coverage
+# ------------------------
+coverage/
+**/coverage/
+.vitest/
+.jest/
+
+# ------------------------
+# OS / System Files
+# ------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------
+# IDE / Editor
+# ------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.history/
+
+# ------------------------
+# Caches
+# ------------------------
+.cache/
+**/.cache/
+.next/
